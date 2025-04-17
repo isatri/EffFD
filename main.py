@@ -17,8 +17,7 @@ Options:
 
     --savgov_iterations=<iter>     Iterations for lc.flatten  [default: 9]
     --savgov_sigma_cutoff=<sig>    Sigma cutoff for lc.flatten  [default: 3]
-
-    --star_max=<max>               Maximum number of stars   [default: None]
+    --star_max=<max>               Maximum number of stars
 
 """
 import os
@@ -89,7 +88,7 @@ def main():
             print('Finding stars in spectral class '+str(spectral_type))
 
         if args['--star_max'] is not None:
-            star_max = int(args['--star_max'])
+            star_max = None  #int(args['--star_max'])
 
         try:  # checks to see if temperature data is already downloaded
             file = open('./tic_with_temp.csv')
@@ -134,7 +133,8 @@ def main():
         # Analyzes light curve from each sector separately
         lc_path_list = glob.glob(os.path.join(star_path, '*.csv'))
         for lc_path in lc_path_list:
-            ut.analyze_lc(lc_path)
+            if 'FFD.csv' not in lc_path:  # NEED TO FIX; is there a better way to export the FFDs?
+                ut.analyze_lc(lc_path)
 
         # Combines flare data from all sectors to make FFD
         flares_path_list = glob.glob(os.path.join(star_path, '*.ecsv'))

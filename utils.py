@@ -9,7 +9,18 @@ from astropy.io import ascii
 from astropy.table import Table
 from scipy.optimize import curve_fit
 from astroquery.vizier import Vizier
+from scipy.signal import savgol_filter
+from scipy.interpolate import interp1d
 import pandas as pd
+
+### These will eventually be options for the input.
+### Here for now until I have time to redo.
+OPTION_END_FLARE_SIGMA = 1.5
+EXPOSURE_TIME = 120 
+WINDOW_SIZE = 31
+CUT_TOP_LIMIT_FACTOR = 1.8
+CUT_BOT_LIMIT_FACTOR = -0.8
+### Thank you for your patience!
 
 
 def type_error_catch(var, vartype, inner_vartype=None, err_msg=None):
@@ -201,6 +212,56 @@ def tics_from_temp(path, teff_low, teff_high, star_max):
         return TIC_list_full
 
 
+def add_indices(arr, num=3):
+    spacing = num*2 + 1  # indices to move to have room for expansion
+    add_range = np.arange(-num, num+1)  # indices range to add to list
+    new_arr = np.zeros(len(arr) * spacing, dtype=int)
+
+    counter = num
+    for value in arr:
+        for change in add_range:
+            new_arr[counter+change] = value + change
+        counter += spacing
+
+    positive_condition = (new_arr >= 0)
+    return np.unique(new_arr[positive_condition])  # return unique positive idx
+
+
+def remove_small_time_blocks(dates_day,
+                             separation_limit_sec=600,
+                             save_limit_sec=18000,
+                             date_conversion_to_sec=86400.0):
+    dates = dates_day * date_conversion_to_sec
+    separations = (dates[1:] - dates[:-1])
+    separation_ends = np.where(separations > separation_limit_sec)[0]
+    separation_ends = np.append(separation_ends, len(dates)-1)  # attach last point
+
+    keep_sections = []
+    start = 0
+    for end in separation_ends:
+        separation = (dates[end] - dates[start])
+        if separation > save_limit_sec:
+            keep_sections.append((start, end))
+        start = end+1
+
+    return keep_sections
+
+
+def smooth(y, box_pts):
+    box = np.ones(box_pts)/box_pts
+    y_smooth = np.convolve(y, box, mode='same')
+    return y_smooth
+
+
+def remove_light_curve_nans(time, flux):
+    cond = (flux > 0.0)
+    return np.array(time[cond]), np.array(flux[cond])
+
+
+def rms(y):
+    return np.sqrt(np.mean(y**2))
+
+
 def save_raw_lc(obj, save_path, filter_iter, filter_sig):
     """Uses lightkurve to retrieve the lightcurve from TESS
     object and saves the light curve image plus the raw data
@@ -227,7 +288,11 @@ def save_raw_lc(obj, save_path, filter_iter, filter_sig):
 
     # SPOC == TESS data pipeline
     # Getting only the 120 second exposure light curves for consistency
-    search_result = lk.search_lightcurve(obj, author='SPOC', exptime=120)
+    # NOTE: this does not necessarily work for binaries anymore?
+    # UV Cet is now split between different TICs which messes things up.
+    # Need to test on different binaries.
+    search_result = lk.search_lightcurve(obj, author='SPOC', exptime=EXPOSURE_TIME)
+    
     if not search_result:
         raise FileNotFoundError('No results for {}.'.format(obj))
 
@@ -242,18 +307,28 @@ def save_raw_lc(obj, save_path, filter_iter, filter_sig):
         if os.path.isfile(save_string+'.csv'):
             print('Sector {} CSV exists for {}'.format(sector, obj))
             continue
-
-        lc = result.download()
-        lc = lc.flatten(niters=filter_iter, sigma=filter_sig)
+        
+        result.table["dataURL"] = result.table["dataURI"]  # workaround MAST issue
+        try:
+            lc = result.download(quality_bitmask='default')
+        except KeyError:
+            print('Sector {} for {} gave a KeyError.'.format(sector, obj))
+            continue
 
         # Save light curve CSV file
         lc.to_csv(save_string + '.csv', overwrite=True)
 
+        lc = lc.flatten(niters=filter_iter, sigma=filter_sig)
+        # The code calls this name if used, so not saving the flattened one
+        # lc.to_csv(save_string + '_flattened.csv', overwrite=True)
+
         # Saves light curve PNG plot
-        plt.figure()
-        lc.plot()
-        plt.savefig(save_string + '.png')
-        plt.close()
+        # Closes figures to avoid memory problems when running for many stars
+        fig, ax = plt.subplots(1,1)
+        lc.plot(ax=ax)
+        fig.savefig(save_string + '.png')
+        fig.clf()
+        plt.close(fig)
 
 
 def group_by_missing(seq):
@@ -282,6 +357,166 @@ def group_by_missing(seq):
     return grouped
 
 
+def plot_lc_diagnostics(time_all, flux_all, time_final, flux_final):
+    fig, ax = plt.subplots()
+    ax.plot(time_all, flux_all, time_final, flux_final)
+    fig.savefig('/Users/itristan/Desktop/diag.png')
+    plt.close(fig)
+
+
+def self_flatten_lc(csv_path):
+    lc = ascii.read(csv_path, guess=False, format='csv')
+    lc_time, lc_flux = remove_light_curve_nans(lc['time'], lc['flux'])
+
+    remsep = remove_small_time_blocks(lc_time)
+    keep_times = np.array([], dtype=int)
+    for b, e in remsep:
+        cond = np.arange(b, e+1, dtype=int)
+        keep_times = np.append(keep_times, cond)
+
+    lc_time_reduced = lc_time[keep_times]
+    lc_flux_reduced = lc_flux[keep_times]
+
+    export_lc_time = np.array([])
+    export_lc_flux = np.array([])
+
+    fig, ax = plt.subplots(4,1, figsize=(7,7), sharex=True)
+    ax[0].plot(lc_time, lc_flux)
+    ax[0].plot(lc_time_reduced, lc_flux_reduced)
+    ax[1].plot(lc_time_reduced, lc_flux_reduced)
+
+    bigsec = remove_small_time_blocks(lc_time_reduced, 18001, 18002)
+    for b, e in bigsec:
+        beginning_time = lc_time_reduced[b]
+        ending_time = lc_time_reduced[e]
+        cond = (lc_time >= beginning_time) & (lc_time <= ending_time)
+
+        final_time = np.copy(lc_time[cond])
+        final_flux = np.copy(lc_flux[cond])
+
+        window = WINDOW_SIZE
+        for i in np.arange(5):
+            data_smooth = savgol_filter(final_flux, window, 3)
+            new_curve = (final_flux - data_smooth)[:-window]
+            flux_rms = rms(new_curve)
+            report_std = np.std((final_flux / data_smooth)[:-window])
+
+            removeable_idxs = np.where(new_curve > CUT_TOP_LIMIT_FACTOR*flux_rms)[0]
+            removeable_idxs = np.append(removeable_idxs, np.where(new_curve < CUT_BOT_LIMIT_FACTOR*flux_rms)[0])
+            #removeable_idxs = add_indices(removeable_idxs, 1)
+
+            final_time = np.delete(final_time, removeable_idxs)
+            final_flux = np.delete(final_flux, removeable_idxs)
+
+        spl = interp1d(x=final_time,
+                       y=final_flux,
+                       kind='linear',
+                       fill_value='extrapolate')
+        interpflux = spl(lc_time[cond])
+
+        ax[1].plot(final_time, final_flux, color='red')
+        ax[2].plot(final_time, final_flux, color='red')
+        ax[2].plot(lc_time[cond], interpflux, color='gray')
+
+        flat_time = lc_time[cond]
+
+        # Mean normalized value should be around 1
+        # If not, normalize by the mean
+        flatten_factor = np.mean((lc_flux[cond]/interpflux)) # match the bottom of the cutoff
+        
+        if flatten_factor > 0.9999:
+            flatten_factor = 1
+
+        flat_flux = (lc_flux[cond]/interpflux) - flatten_factor
+
+        export_lc_time = np.append(export_lc_time, flat_time)
+        export_lc_flux = np.append(export_lc_flux, flat_flux)
+
+    ax[0].set(ylabel='Starting LC\n[electrons/s]')
+    ax[1].set(ylabel='Flux\n[electrons/s]')
+    ax[2].set(ylabel='Quiescent Line\n[electrons/s]')
+    ax[3].plot(export_lc_time, export_lc_flux, '-o', ms=2, lw=1, alpha=0.5)
+    ax[3].set(xlabel='Time [BTJD Days]',
+              ylabel='Flattened LC')
+    fig.tight_layout()
+    fig.savefig(csv_path.replace('.csv', '_lc_diagnostics.png'))
+    plt.close(fig)
+
+    def calc_quiet_std(flux, iterations=2, sigma=2.0):
+        std = np.max(np.abs(flux))
+        for iteration in range(iterations):
+            std_cond = (flux <= sigma*std) & (flux >= -sigma*std)
+            std = np.sqrt(np.mean(flux[std_cond]**2))
+        return std
+
+    report_std = calc_quiet_std(export_lc_flux)
+    # report_std = np.sqrt(np.mean(export_lc_flux**2))
+    # std_cond = (export_lc_flux <= 2*report_std) & (export_lc_flux >= -2*report_std) 
+    # report_std = np.sqrt(np.mean(export_lc_flux[std_cond]**2))
+    # print('Testing std calculator: {} (manu) vs. {} (func)'.format(report_std,
+    #                                                                calc_quiet_std(export_lc_flux)))
+
+    return export_lc_time, export_lc_flux, report_std
+
+
+def plot_flares_and_lc(T, F, flare_list, reported_std=0.0, pathname=''):
+
+    plot_title = pathname.split('/')[-1].replace('_', ' ').replace('.csv','')
+    plot_title = plot_title[:-3] + ': Sector' + plot_title[-3:]
+
+    lc_fig, lc_ax = plt.subplots()
+    lc_ax.plot(T, F, '-o', ms=2, lw=1, alpha=0.5)
+    lc_ax.axhline(reported_std, color='black', ls='--', alpha=0.8)
+
+    fig_rows = 5
+    fig_cols = -(-len(flare_list) // fig_rows)
+    ffig, fax = plt.subplots(fig_cols, fig_rows, figsize=(fig_rows*2,fig_cols*2))
+    fax = fax.ravel()
+
+    for count, flare_idxs in enumerate(flare_list):
+        lc_ax.plot(T[flare_idxs], F[flare_idxs], color='red')
+        time_flare_graph = (T[flare_idxs] - T[flare_idxs[0]]) * 1440.0
+        fax[count].axhline(0, color='gray', ls='-', alpha=1.0)
+        fax[count].axhline(reported_std, color='gray', ls='--', alpha=1.0)
+        fax[count].axhline(reported_std/3.0, color='gray', ls='--', alpha=1.0)
+        fax[count].plot(time_flare_graph, F[flare_idxs],
+                        color='red', ls='-', marker='+', ms=5)
+
+    if len(flare_list) < fig_cols*fig_rows:
+        for leftover in range(count+1, fig_cols*fig_rows):
+            fax[leftover].set_axis_off()
+
+    ffig.text(0.5, 0.98, plot_title,
+              va='center', ha='center', fontsize=12)
+    ffig.text(0.5, 0.02, 'Flaring Time [min]',
+              va='center', ha='center', fontsize=12)
+    ffig.text(0.02, 0.5, 'Normalized Flux',
+                va='center', ha='center', rotation='vertical', fontsize=12)
+
+    ffig.tight_layout(rect=[0.03, 0.03, 1, 0.97])
+    ffig.savefig(pathname.replace('.csv','_all_flares.png'))
+    plt.close(ffig)
+
+    lc_ax.set(xlabel='Time BJD [day]',
+              ylabel='Normalized Flux',
+              title=plot_title)
+    lc_fig.tight_layout()
+    lc_fig.savefig(pathname.replace('.csv','_marked_lc.png'))
+    plt.close(lc_fig)
+
+
+def expand_flare_indices(flux, flare, sigma):
+    for place in [0, -1]:
+        val = flux[flare[place]]
+        while val > sigma:
+            new_idx = flare[place] - 1 - (2*place)
+            if place==0:
+                flare.insert(place, new_idx)
+            elif place==-1:
+                flare.append(new_idx)
+            val = flux[new_idx]
+
+
 def analyze_lc(csv_path):
     """Takes the light curve data and finds flares
     using a 3 sigma method. If flares are found
@@ -300,16 +535,21 @@ def analyze_lc(csv_path):
 
     type_error_catch(csv_path, str)
 
-    lc = ascii.read(csv_path, guess=False, format='csv')
+    time, flux, lcrms = self_flatten_lc(csv_path)
+
     # Flare finding method
-    criteria = 1 + 3*np.std(lc['flux'])
-    criteria_index = np.where(lc['flux'] > criteria)[0]
+    criteria = 3*lcrms
+    criteria_index = np.where(flux > criteria)[0]
     grouped_criteria = group_by_missing(criteria_index.tolist())
 
     flare_index = []
     for group in grouped_criteria:
         if len(group) >= 3:
             flare_index.append(group)
+        elif len(group) >= 1:
+            expand_flare_indices(flux, group, lcrms*OPTION_END_FLARE_SIGMA)
+            if len(group) >= 4:
+                flare_index.append(group)
 
     if len(flare_index) == 0:
         print('No flares found in this sector data')
@@ -319,23 +559,38 @@ def analyze_lc(csv_path):
         flare_table = Table(names=['start_time', 'end_time', 'duration',
                                    'max_flux', 'max_flux_time', 'fluence'])
 
+        for flare in flare_index:
+            expand_flare_indices(flux, flare, lcrms*OPTION_END_FLARE_SIGMA)
+        flare_index = np.unique(np.array(flare_index, dtype=object))
+
+        if type(flare_index[0]) is int:  # Catch when there is only one flare
+            flare_index = [flare_index.tolist()]
+
+        plot_flares_and_lc(time, flux, flare_index, criteria, csv_path)
+
         for counts, flare in enumerate(flare_index):
-            flare_flux = lc['flux'][flare] - 1  # quiscent=1; flare-only flux
-            flare_time = lc['time'][flare]
+
+            flare_flux = flux[flare]
+            flare_time = time[flare] * 86400.0 * u.second
 
             # Flare properties of interest
-            t_start = lc['time'][flare[0]]
-            t_end = lc['time'][flare[-1]]
+            t_start = flare_time[0]
+            t_end = flare_time[-1]
             duration = t_end - t_start
             flux_max = np.max(flare_flux)
             t_flux_max = flare_time[(flare_flux == flux_max)]
-            fluence = np.sum(flare_flux)
+            fluence = np.trapz(y=flare_flux, x=flare_time)
 
-            flare_table.add_row([t_start, t_end, duration,
-                                 flux_max, t_flux_max, fluence])
+            # This was added because of a problemw ith CR Dra
+            # Where one of the estimated light curves wwnt down suddenly
+            # at the start. This needs to be sorted out, bc a fake flare was
+            # created there.
+            if duration > 0.0:
+                flare_table.add_row([t_start, t_end, duration,
+                                     flux_max, t_flux_max, fluence])
 
         # Save total light curve monitoring time for FFD statistics
-        flare_table['total_lc_time'] = len(lc['time']) * 120.0 * u.second
+        flare_table['total_lc_time'] = len(time) * EXPOSURE_TIME * u.second
         save_path = csv_path.replace('.csv', '_flares.ecsv')
         flare_table.write(save_path, overwrite=True)
 
@@ -473,19 +728,18 @@ def get_time_and_energy(paths):
         try:
             tbl = ascii.read(file_path, guess=False, format='ecsv')
 
-            time += tbl['total_lc_time'][0] * \
-                (1.0 * tbl['total_lc_time'].unit).to(u.day)
+            time += tbl['total_lc_time'][0] * (1.0 * tbl['total_lc_time'].unit).to(u.day)
 
             flare_eng = np.append(flare_eng, tbl['fluence'].value)
 
-            flare_duration = np.append(
-                flare_duration, tbl['duration'].value*24*60)
+            flare_duration = np.append(flare_duration, tbl['duration'].value)
 
         except FileNotFoundError:
             print('Flare filepath ' + file_path + ' not found.')
             continue
 
     flare_eng.sort()
+    print(time)
     return time.value, flare_eng, tbl['fluence'].unit, flare_duration
 
 
@@ -544,8 +798,8 @@ def generate_ffd(obj, save_path, list_of_paths):
     type_error_catch(save_path, str)
     type_error_catch(list_of_paths, list, str)
 
-    monitoring_time, flare_energy, e_unit, duration = get_time_and_energy(
-        list_of_paths)
+    monitoring_time, flare_energy, e_unit, duration = get_time_and_energy(list_of_paths)
+    duration = duration/60.0  # minutes
 
     log_energy, log_frequency = get_log_freq(flare_energy, monitoring_time)
 
@@ -558,12 +812,19 @@ def generate_ffd(obj, save_path, list_of_paths):
 
     # alpha is used in some papers, but we don't need it for now
     # alpha = np.abs(slope - 1)
+
+    savetbl = Table([log_frequency, log_energy],
+                    names=['log10_frequency', 'log10_ED_sec'])
+    savetbl.write('{}/{}_FFD.csv'.format(save_path, obj.replace(' ', '_')),
+                  overwrite=True)
+
     fig = plt.figure(figsize=(7.5, 3.5))
 
     ax = fig.add_axes([0.05, 0.05, 0.5, 1])
     ax2 = fig.add_axes([0.7, 0.05, 0.5, 1])
     cax = fig.add_axes([1.2, 0.05, 0.04, 1])
     col_map = plt.cm.get_cmap('magma')
+
     if len(flare_energy) >= 3:
         divnorm = mpl.colors.TwoSlopeNorm(
             vmin=duration.min(), vcenter=np.mean(duration),
@@ -571,9 +832,10 @@ def generate_ffd(obj, save_path, list_of_paths):
         sm = plt.cm.ScalarMappable(cmap='viridis', norm=divnorm)
         sm.set_array([])
         colour = sm.to_rgba(duration)
-        cbar = plt.colorbar(sm, cax=cax, ticks=[
-                            duration.min(), np.mean(duration), duration.max()])
-        cbar.set_label('Duration [minutes]', labelpad=-50)
+        cbar = plt.colorbar(sm, cax=cax, ticks=[int(duration.min())+1,
+                                                int(np.mean(duration)),
+                                                int(duration.max())])
+        cbar.set_label('Duration [minutes]', labelpad=-40)
         cax.yaxis.set_ticks_position('right')
     else:
         colour = 'blue'
@@ -590,17 +852,17 @@ def generate_ffd(obj, save_path, list_of_paths):
                  color='black',
                  label=r'Slope: $%.2f\pm%.2f$' % (slope, slope_err))
         ax2.legend()
-    ax2.set(xlabel=r'Log$_{10}$ TESS Fluence',
+    ax2.set(xlabel=r'Log$_{10}$ $ED_{TESS}$ [s]',
             ylabel=r'Cumulative Number of Flares $>E_{TESS}$ Per Day',
             title='EFFD for {}'.format(obj),
             yscale='log')
 
     # Creates histogram
-    N, bins, patches = ax.hist(flare_energy, edgecolor='black', linewidth=1)
+    N, bins, patches = ax.hist(np.log10(flare_energy), edgecolor='black', linewidth=1)
     for i in range(len(N)):
         patches[i].set_facecolor(col_map(N[i]/N.max()))
 
-    ax.set(ylabel='Frequency', xlabel='Flare Energy',
+    ax.set(ylabel='Frequency', xlabel=r'Log$_{10}$ $ED_{TESS}$ [s]',
            title='Histogram for {}'.format(obj))
 
     plt.savefig('{}/{}_FFD.png'.format(save_path,
