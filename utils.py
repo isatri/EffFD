@@ -15,13 +15,23 @@ import pandas as pd
 
 ### These will eventually be options for the input.
 ### Here for now until I have time to redo.
-OPTION_END_FLARE_SIGMA = 1.5
-EXPOSURE_TIME = 120 
-WINDOW_SIZE = 31
+FLUX_TYPE = 'pdcsap_flux'  # pdcsap_flux or sap flux, PDC is processed, SAP is 'raw' data.
+                           # The one that is better will depend on your project.
+                           # 
+EXPOSURE_TIME = 20 
+WINDOW_ITERATIONS = 5
 CUT_TOP_LIMIT_FACTOR = 1.8
 CUT_BOT_LIMIT_FACTOR = -0.8
+
+OPTION_INITIAL_CUTOFF_SIGMA = 3
+OPTION_END_FLARE_SIGMA = 1.0
 ### Thank you for your patience!
 
+# Change the window for smoothening depending on if you are using 20-sec or 2-min data
+if EXPOSURE_TIME==20:
+    WINDOW_SIZE = 151
+else:
+    WINDOW_SIZE = 31
 
 def type_error_catch(var, vartype, inner_vartype=None, err_msg=None):
     if not isinstance(var, vartype):
@@ -366,7 +376,7 @@ def plot_lc_diagnostics(time_all, flux_all, time_final, flux_final):
 
 def self_flatten_lc(csv_path):
     lc = ascii.read(csv_path, guess=False, format='csv')
-    lc_time, lc_flux = remove_light_curve_nans(lc['time'], lc['flux'])
+    lc_time, lc_flux = remove_light_curve_nans(lc['time'], lc[FLUX_TYPE])
 
     remsep = remove_small_time_blocks(lc_time)
     keep_times = np.array([], dtype=int)
@@ -395,7 +405,8 @@ def self_flatten_lc(csv_path):
         final_flux = np.copy(lc_flux[cond])
 
         window = WINDOW_SIZE
-        for i in np.arange(5):
+        window_iter = WINDOW_ITERATIONS
+        for i in np.arange(window_iter):
             data_smooth = savgol_filter(final_flux, window, 3)
             new_curve = (final_flux - data_smooth)[:-window]
             flux_rms = rms(new_curve)
@@ -465,7 +476,7 @@ def plot_flares_and_lc(T, F, flare_list, reported_std=0.0, pathname=''):
     plot_title = plot_title[:-3] + ': Sector' + plot_title[-3:]
 
     lc_fig, lc_ax = plt.subplots()
-    lc_ax.plot(T, F, '-o', ms=2, lw=1, alpha=0.5)
+    lc_ax.plot(T, F, 'o', ms=2, lw=1, alpha=0.5)
     lc_ax.axhline(reported_std, color='black', ls='--', alpha=0.8)
 
     fig_rows = 5
@@ -514,7 +525,12 @@ def expand_flare_indices(flux, flare, sigma):
                 flare.insert(place, new_idx)
             elif place==-1:
                 flare.append(new_idx)
-            val = flux[new_idx]
+
+            try:
+                val = flux[new_idx]
+            except IndexError:
+                print('Flare ran out of times to expand.')
+                val = 0
 
 
 def analyze_lc(csv_path):
@@ -538,7 +554,7 @@ def analyze_lc(csv_path):
     time, flux, lcrms = self_flatten_lc(csv_path)
 
     # Flare finding method
-    criteria = 3*lcrms
+    criteria = OPTION_INITIAL_CUTOFF_SIGMA * lcrms
     criteria_index = np.where(flux > criteria)[0]
     grouped_criteria = group_by_missing(criteria_index.tolist())
 
@@ -546,10 +562,12 @@ def analyze_lc(csv_path):
     for group in grouped_criteria:
         if len(group) >= 3:
             flare_index.append(group)
-        elif len(group) >= 1:
+        ### COMMENT THIS PART TO ONLY GET THE CLEAREST FLARES ###
+        elif len(group) >= 2 and len(flux) not in group: 
             expand_flare_indices(flux, group, lcrms*OPTION_END_FLARE_SIGMA)
-            if len(group) >= 4:
+            if len(group) >= 12:
                 flare_index.append(group)
+        #########################################################
 
     if len(flare_index) == 0:
         print('No flares found in this sector data')
@@ -560,7 +578,10 @@ def analyze_lc(csv_path):
                                    'max_flux', 'max_flux_time', 'fluence'])
 
         for flare in flare_index:
-            expand_flare_indices(flux, flare, lcrms*OPTION_END_FLARE_SIGMA)
+            if len(flux) not in flare:
+                expand_flare_indices(flux, flare, lcrms*OPTION_END_FLARE_SIGMA)
+            else:
+                flare.pop(-1)
         flare_index = np.unique(np.array(flare_index, dtype=object))
 
         if type(flare_index[0]) is int:  # Catch when there is only one flare
