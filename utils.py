@@ -17,8 +17,7 @@ import pandas as pd
 ### Here for now until I have time to redo.
 FLUX_TYPE = 'pdcsap_flux'  # pdcsap_flux or sap flux, PDC is processed, SAP is 'raw' data.
                            # The one that is better will depend on your project.
-                           # 
-EXPOSURE_TIME = 20 
+EXPOSURE_TIME = 120        # 120 seconds (2 min) or 20 seconds
 WINDOW_ITERATIONS = 5
 CUT_TOP_LIMIT_FACTOR = 1.8
 CUT_BOT_LIMIT_FACTOR = -0.8
