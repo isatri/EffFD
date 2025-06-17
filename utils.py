@@ -29,8 +29,10 @@ OPTION_END_FLARE_SIGMA = 1.0
 # Change the window for smoothening depending on if you are using 20-sec or 2-min data
 if EXPOSURE_TIME==20:
     WINDOW_SIZE = 151
+    FINAL_LENGTH_CONDITION = 12  # how many data points a flare needs to be after expansion to be selected
 else:
     WINDOW_SIZE = 31
+    FINAL_LENGTH_CONDITION = 4
 
 def type_error_catch(var, vartype, inner_vartype=None, err_msg=None):
     if not isinstance(var, vartype):
@@ -564,7 +566,7 @@ def analyze_lc(csv_path):
         ### COMMENT THIS PART TO ONLY GET THE CLEAREST FLARES ###
         elif len(group) >= 2 and len(flux) not in group: 
             expand_flare_indices(flux, group, lcrms*OPTION_END_FLARE_SIGMA)
-            if len(group) >= 12:
+            if len(group) >= FINAL_LENGTH_CONDITION:
                 flare_index.append(group)
         #########################################################
 
